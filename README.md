@@ -1,4 +1,4 @@
-# KPS Identity Client
+# NVİ KPS Client
 
 [![npm version](https://img.shields.io/npm/v/@yucelozalp/kps-identity-client.svg)](https://www.npmjs.com/package/@yucelozalp/kps-identity-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
