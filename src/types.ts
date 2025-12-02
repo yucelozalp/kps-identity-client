@@ -75,6 +75,8 @@ export interface KPSClientConfig {
   password: string;
   /** HTTP client configuration */
   httpConfig?: HttpClientConfig;
+  /** Enable debug mode (logs SOAP requests/responses) */
+  debug?: boolean;
 }
 
 /**

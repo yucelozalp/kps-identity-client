@@ -72,25 +72,33 @@ export function buildQueryBody(request: QueryRequest): string {
  * Build timestamp
  * @internal
  */
-export function buildTimestamp(): { xml: string; created: string; expires: string } {
+export function buildTimestamp(): { xml: string; xmlForEnvelope: string; created: string; expires: string } {
   const now = new Date();
   const created = formatISODate(now);
   const expires = formatISODate(new Date(now.getTime() + 5 * 60 * 1000));
 
+  // XML with namespace for canonicalization (used for digest)
   const xml = `<wsu:Timestamp xmlns:wsu="${NAMESPACES.WSU_NS}" wsu:Id="_0">
 <wsu:Created>${created}</wsu:Created>
 <wsu:Expires>${expires}</wsu:Expires>
 </wsu:Timestamp>`;
 
-  return { xml, created, expires };
+  // XML without namespace declaration for envelope (Security element already has namespace)
+  const xmlForEnvelope = `<wsu:Timestamp wsu:Id="_0">
+<wsu:Created>${created}</wsu:Created>
+<wsu:Expires>${expires}</wsu:Expires>
+</wsu:Timestamp>`;
+
+  return { xml, xmlForEnvelope, created, expires };
 }
 
 /**
- * Build SignedInfo
+ * Build SignedInfo (without namespace declaration, will be added by Signature element)
  * @internal
  */
-export function buildSignedInfo(digestValue: string): string {
-  return `<dsig:SignedInfo xmlns:dsig="${NAMESPACES.DSIG_NS}">
+export function buildSignedInfo(digestValue: string): { xml: string; xmlForSignature: string } {
+  // XML with namespace for canonicalization (used for signature calculation)
+  const xml = `<dsig:SignedInfo xmlns:dsig="${NAMESPACES.DSIG_NS}">
   <dsig:CanonicalizationMethod Algorithm="${ALGORITHMS.C14N}"/>
   <dsig:SignatureMethod Algorithm="${ALGORITHMS.HMAC_SHA1}"/>
   <dsig:Reference URI="#_0">
@@ -101,6 +109,21 @@ export function buildSignedInfo(digestValue: string): string {
     <dsig:DigestValue>${digestValue}</dsig:DigestValue>
   </dsig:Reference>
 </dsig:SignedInfo>`;
+
+  // XML without namespace declaration for Signature element (Signature already has namespace)
+  const xmlForSignature = `<dsig:SignedInfo>
+  <dsig:CanonicalizationMethod Algorithm="${ALGORITHMS.C14N}"/>
+  <dsig:SignatureMethod Algorithm="${ALGORITHMS.HMAC_SHA1}"/>
+  <dsig:Reference URI="#_0">
+    <dsig:Transforms>
+      <dsig:Transform Algorithm="${ALGORITHMS.C14N}"/>
+    </dsig:Transforms>
+    <dsig:DigestMethod Algorithm="${ALGORITHMS.SHA1}"/>
+    <dsig:DigestValue>${digestValue}</dsig:DigestValue>
+  </dsig:Reference>
+</dsig:SignedInfo>`;
+
+  return { xml, xmlForSignature };
 }
 
 /**

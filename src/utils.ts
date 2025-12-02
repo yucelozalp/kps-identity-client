@@ -28,8 +28,16 @@ export function formatISODate(date: Date): string {
  * @internal
  */
 export function canonicalizeXML(xml: string): string {
+  // Remove XML declaration
   let canonical = xml.replace(/<\?xml[^?]*\?>\s*/g, '');
+  
+  // Normalize whitespace between tags (remove all whitespace between > and <)
   canonical = canonical.replace(/>\s+</g, '><');
+  
+  // Remove leading/trailing whitespace from text content
+  canonical = canonical.replace(/>\s+/g, '>');
+  canonical = canonical.replace(/\s+</g, '<');
+  
   return canonical.trim();
 }
 

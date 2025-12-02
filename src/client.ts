@@ -47,6 +47,7 @@ export class KPSClient {
   private username: string;
   private password: string;
   private responseParser: ResponseParser;
+  private debug: boolean;
 
   /**
    * Create a new KPS client
@@ -56,6 +57,7 @@ export class KPSClient {
     this.validateConfig(config);
     this.username = config.username;
     this.password = config.password;
+    this.debug = config.debug || false;
     
     this.httpClient = axios.create({
       timeout: config.httpConfig?.timeout || DEFAULT_TIMEOUT,
@@ -153,8 +155,17 @@ export class KPSClient {
   private async getSecurityToken(): Promise<STSArtifacts> {
     const soapRequest = buildSTSRequest(this.username, this.password);
 
+    if (this.debug) {
+      console.log('[KPS Debug] STS Request:', soapRequest);
+    }
+
     try {
       const response = await this.httpClient.post(KPS_URLS.STS, soapRequest);
+
+      if (this.debug) {
+        console.log('[KPS Debug] STS Response Status:', response.status);
+        console.log('[KPS Debug] STS Response:', response.data);
+      }
 
       if (response.status !== 200) {
         throw new STSError(`STS returned HTTP ${response.status}`);
@@ -243,28 +254,41 @@ export class KPSClient {
   }
 
   private buildSignedEnvelope(artifacts: STSArtifacts, bodyXML: string): string {
-    const { xml: timestampXML } = buildTimestamp();
+    const { xml: timestampXML, xmlForEnvelope: timestampXMLForEnvelope } = buildTimestamp();
     const canonicalTimestamp = canonicalizeXML(timestampXML);
     const timestampDigest = sha1Digest(canonicalTimestamp);
     const digestValue = base64Encode(timestampDigest);
 
-    const signedInfo = buildSignedInfo(digestValue);
-    const canonicalSignedInfo = canonicalizeXML(signedInfo);
+    const { xml: signedInfoXML, xmlForSignature: signedInfoForSignature } = buildSignedInfo(digestValue);
+    const canonicalSignedInfo = canonicalizeXML(signedInfoXML);
     const secretKey = base64Decode(artifacts.binarySecretB64);
     const signatureBytes = hmacSha1(secretKey, canonicalSignedInfo);
     const signatureValue = base64Encode(signatureBytes);
 
-    const signature = buildSignature(signedInfo, signatureValue, artifacts.assertionID);
+    const signature = buildSignature(signedInfoForSignature, signatureValue, artifacts.assertionID);
 
-    return buildServiceEnvelope(timestampXML, artifacts.tokenXML, signature, bodyXML);
+    return buildServiceEnvelope(timestampXMLForEnvelope, artifacts.tokenXML, signature, bodyXML);
   }
 
   private async callService(envelope: string): Promise<string> {
+    if (this.debug) {
+      console.log('[KPS Debug] Service Request:', envelope);
+    }
+
     try {
       const response = await this.httpClient.post(KPS_URLS.QUERY, envelope);
 
+      if (this.debug) {
+        console.log('[KPS Debug] Service Response Status:', response.status);
+        console.log('[KPS Debug] Service Response:', response.data);
+      }
+
       if (response.status !== 200) {
-        throw new ServiceError(`Service returned HTTP ${response.status}`);
+        const faultMessage = this.extractFaultMessage(response.data);
+        throw new ServiceError(
+          `Service returned HTTP ${response.status}${faultMessage ? `: ${faultMessage}` : ''}`,
+          { response: response.data }
+        );
       }
 
       return response.data;
@@ -274,7 +298,19 @@ export class KPSClient {
       }
 
       if (error.response) {
-        throw new ServiceError(`Service request failed: ${error.message}`, { response: error.response.data });
+        const responseData = typeof error.response.data === 'string' 
+          ? error.response.data 
+          : JSON.stringify(error.response.data);
+        
+        const faultMessage = this.extractFaultMessage(responseData);
+        const errorMessage = faultMessage 
+          ? `Service request failed: ${faultMessage}`
+          : `Service request failed: ${error.message}`;
+        
+        throw new ServiceError(errorMessage, { 
+          response: error.response.data,
+          statusCode: error.response.status,
+        });
       }
 
       if (error.request) {
@@ -283,5 +319,42 @@ export class KPSClient {
 
       throw error;
     }
+  }
+
+  private extractFaultMessage(responseXml: string): string | null {
+    if (!responseXml || typeof responseXml !== 'string') {
+      return null;
+    }
+
+    // Try to extract fault reason/text from SOAP fault
+    const faultPatterns = [
+      /<s:Text[^>]*>([^<]+)<\/s:Text>/i,
+      /<soap:Text[^>]*>([^<]+)<\/soap:Text>/i,
+      /<faultstring[^>]*>([^<]+)<\/faultstring>/i,
+      /<Reason[^>]*>.*?<Text[^>]*>([^<]+)<\/Text>.*?<\/Reason>/is,
+    ];
+
+    for (const pattern of faultPatterns) {
+      const match = responseXml.match(pattern);
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+    }
+
+    // Try to extract fault code
+    const faultCodePatterns = [
+      /<s:Value[^>]*>([^<]+)<\/s:Value>/i,
+      /<soap:Value[^>]*>([^<]+)<\/soap:Value>/i,
+      /<faultcode[^>]*>([^<]+)<\/faultcode>/i,
+    ];
+
+    for (const pattern of faultCodePatterns) {
+      const match = responseXml.match(pattern);
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+    }
+
+    return null;
   }
 }

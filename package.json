@@ -1,6 +1,6 @@
 {
   "name": "@yucelozalp/kps-identity-client",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Professional Turkish National Identity (TC Kimlik) verification client for Node.js - KPS v2 API integration",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

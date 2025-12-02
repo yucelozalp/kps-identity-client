@@ -10,12 +10,34 @@ export class ResponseParser {
   async parseResponse(responseXML: string): Promise<QueryResult> {
     try {
       const doc = await parseXML(responseXML);
-      const doluBilesenler = this.findElement(doc, 'DoluBilesenler');
+      
+      // Navigate through SOAP envelope structure
+      const envelope = this.findElement(doc, 'Envelope') || this.findElement(doc, 's:Envelope');
+      if (!envelope) {
+        throw new ParseError('SOAP Envelope not found in response');
+      }
+      
+      const body = this.findElement(envelope, 'Body') || this.findElement(envelope, 's:Body');
+      if (!body) {
+        throw new ParseError('SOAP Body not found in response');
+      }
+      
+      const sorgulaResponse = this.findElement(body, 'SorgulaResponse');
+      if (!sorgulaResponse) {
+        throw new ParseError('SorgulaResponse not found in response');
+      }
+      
+      const sorgulaResult = this.findElement(sorgulaResponse, 'SorgulaResult');
+      if (!sorgulaResult) {
+        throw new ParseError('SorgulaResult not found in response');
+      }
+      
+      const doluBilesenler = this.findElement(sorgulaResult, 'DoluBilesenler');
       const preference = this.getPreferredBucket(doluBilesenler);
       const buckets = this.getBucketOrder(preference);
       
       for (const bucket of buckets) {
-        const result = await this.parsePersonBucket(doc, bucket, responseXML);
+        const result = await this.parsePersonBucket(sorgulaResult, bucket, responseXML);
         if (result) return result;
       }
 
@@ -51,11 +73,14 @@ export class ResponseParser {
   }
 
   private async parsePersonBucket(
-    doc: any,
+    sorgulaResult: any,
     bucket: { type: PersonType; path: string },
     rawXML: string
   ): Promise<QueryResult | null> {
-    const kisiBilgisi = this.findElement(doc, bucket.path, 'KisiBilgisi');
+    const doluBilesenler = this.findElement(sorgulaResult, 'DoluBilesenler');
+    if (!doluBilesenler) return null;
+    
+    const kisiBilgisi = this.findElement(doluBilesenler, bucket.path, 'KisiBilgisi');
     if (!kisiBilgisi) return null;
 
     const durumBilgisi = this.findElement(kisiBilgisi, 'DurumBilgisi');
@@ -120,12 +145,20 @@ export class ResponseParser {
       const lowerSegment = segment.toLowerCase();
       let found = false;
       
-      for (const key of Object.keys(current)) {
-        const lowerKey = key.toLowerCase().split(':').pop() || '';
-        if (lowerKey === lowerSegment) {
-          current = current[key];
-          found = true;
-          break;
+      // First try exact match (for namespace-prefixed elements like 's:Envelope')
+      if (current[segment]) {
+        current = current[segment];
+        found = true;
+      } else {
+        // Then try case-insensitive match on local name (after colon)
+        for (const key of Object.keys(current)) {
+          const lowerKey = key.toLowerCase();
+          const localName = lowerKey.split(':').pop() || lowerKey;
+          if (localName === lowerSegment) {
+            current = current[key];
+            found = true;
+            break;
+          }
         }
       }
       
