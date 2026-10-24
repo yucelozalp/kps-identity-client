@@ -20,14 +20,13 @@ async function main() {
 
   try {
     const result = await client.verify({
-      tcno: '12345678901',
+      tcno: '10000000146',
       firstname: 'AHMET',
       lastname: 'YILMAZ',
       birthyear: '1990',
     });
 
     console.log('Result:', result);
-
   } catch (error) {
     if (isKPSError(error)) {
       console.log('KPS Error:', error.code);

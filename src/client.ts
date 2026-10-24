@@ -1,16 +1,20 @@
+import https from 'https';
 import axios, { AxiosInstance } from 'axios';
-import { KPS_URLS, DEFAULT_TIMEOUT } from './constants';
-import { KPSClientConfig, QueryRequest, QueryResult, STSArtifacts } from './types';
-import { ResponseParser } from './response-parser';
-import { buildSTSRequest, buildQueryBody, buildTimestamp, buildSignedInfo, buildSignature, buildServiceEnvelope } from './soap-builder';
+import { KPS_URLS, DEFAULT_TIMEOUT, DEFAULT_BATCH_SIZE, TOKEN_REFRESH_MARGIN } from './constants';
 import {
-  canonicalizeXML,
-  sha1Digest,
-  hmacSha1,
-  base64Encode,
-  base64Decode,
-  extractInnerXML,
-} from './utils';
+  KPSClientConfig,
+  KPSLogger,
+  QueryRequest,
+  QueryResult,
+  STSArtifacts,
+  VerifyManyOptions,
+} from './types';
+import { ResponseParser, ParsedRecord } from './response-parser';
+import { buildSTSRequest, buildQueryBody, buildSignedEnvelope } from './soap-builder';
+import { parseSTSResponse } from './sts';
+import { TokenProvider } from './token-provider';
+import { collectValidationErrors, normalizeRequest, NormalizedQuery } from './validation';
+import { parseSoapFault, redactSecrets, SoapFault } from './utils';
 import {
   ValidationError,
   STSError,
@@ -22,32 +26,37 @@ import {
 
 /**
  * KPS Identity Verification Client
- * 
+ *
  * @example
  * ```typescript
  * import { KPSClient } from '@yucelozalp/kps-identity-client';
- * 
+ *
  * const client = new KPSClient({
  *   username: 'your_username',
  *   password: 'your_password',
  * });
- * 
+ *
  * const result = await client.verify({
- *   tcno: '12345678901',
+ *   tcno: '10000000146',
  *   firstname: 'AHMET',
  *   lastname: 'YILMAZ',
  *   birthyear: '1990',
  * });
- * 
+ *
  * console.log(result.status); // true if verified
  * ```
  */
 export class KPSClient {
-  private httpClient: AxiosInstance;
-  private username: string;
-  private password: string;
-  private responseParser: ResponseParser;
-  private debug: boolean;
+  private readonly httpClient: AxiosInstance;
+  private readonly username: string;
+  private readonly password: string;
+  private readonly responseParser = new ResponseParser();
+  private readonly tokenProvider: TokenProvider;
+  private readonly debug: boolean;
+  private readonly logger: KPSLogger;
+  private readonly validateChecksum: boolean;
+  private readonly includeRaw: boolean;
+  private readonly endpoints: { sts: string; query: string };
 
   /**
    * Create a new KPS client
@@ -58,42 +67,61 @@ export class KPSClient {
     this.username = config.username;
     this.password = config.password;
     this.debug = config.debug || false;
-    
+    this.logger = config.logger || console;
+    this.validateChecksum = config.validateChecksum || false;
+    this.includeRaw = config.includeRaw !== false;
+    this.endpoints = {
+      sts: config.endpoints?.sts || KPS_URLS.STS,
+      query: config.endpoints?.query || KPS_URLS.QUERY,
+    };
+
+    const httpsAgent =
+      config.httpConfig?.httpsAgent ||
+      (config.httpConfig?.keepAlive
+        ? new https.Agent({ keepAlive: true, scheduling: 'lifo', timeout: 5000 })
+        : undefined);
+
     this.httpClient = axios.create({
       timeout: config.httpConfig?.timeout || DEFAULT_TIMEOUT,
       headers: {
         'Content-Type': 'application/soap+xml; charset=utf-8',
         ...config.httpConfig?.headers,
       },
+      httpsAgent,
+      responseType: 'text',
+      transformResponse: [(data) => data],
     });
 
-    this.responseParser = new ResponseParser();
+    this.tokenProvider = new TokenProvider(() => this.requestSecurityToken(), {
+      enabled: config.cacheToken !== false,
+      refreshMargin: TOKEN_REFRESH_MARGIN,
+    });
   }
 
   /**
    * Verify Turkish national identity
-   * 
+   *
    * @param request Identity information to verify
    * @returns Verification result
-   * 
+   *
    * @throws {ValidationError} If request parameters are invalid
    * @throws {AuthenticationError} If KPS credentials are invalid
    * @throws {STSError} If STS token service fails
    * @throws {ServiceError} If KPS service fails
    * @throws {NetworkError} If network connection fails
    * @throws {TimeoutError} If request times out
-   * 
+   *
    * @example
    * ```typescript
    * const result = await client.verify({
-   *   tcno: '12345678901',
+   *   tcno: '10000000146',
    *   firstname: 'AHMET',
    *   lastname: 'YILMAZ',
    *   birthyear: '1990',
    *   birthmonth: '01',
    *   birthday: '15',
    * });
-   * 
+   *
    * if (result.status) {
    *   console.log('Identity verified!');
    *   console.log('Person type:', result.person);
@@ -104,131 +132,204 @@ export class KPSClient {
    * ```
    */
   async verify(request: QueryRequest): Promise<QueryResult> {
-    this.validateRequest(request);
+    const criteria = this.prepareCriteria([request]);
+    const [result] = await this.query(criteria);
+    return result;
+  }
 
-    const artifacts = await this.getSecurityToken();
-    const bodyXML = buildQueryBody(request);
-    const envelope = this.buildSignedEnvelope(artifacts, bodyXML);
-    const responseXML = await this.callService(envelope);
-    
-    return await this.responseParser.parseResponse(responseXML);
+  /**
+   * Verify several identities with as few KPS requests as possible.
+   * All requests are validated before anything is sent; results keep the input order.
+   *
+   * @param requests Identities to verify
+   * @param options Batch options
+   * @returns One result per request, in the same order
+   *
+   * @example
+   * ```typescript
+   * const results = await client.verifyMany([
+   *   { tcno: '10000000146', firstname: 'AHMET', lastname: 'YILMAZ', birthyear: '1990' },
+   *   { tcno: '99000000042', firstname: 'JOHN', lastname: 'DOE', birthyear: '1985' },
+   * ]);
+   * ```
+   */
+  async verifyMany(
+    requests: QueryRequest[],
+    options: VerifyManyOptions = {}
+  ): Promise<QueryResult[]> {
+    if (!Array.isArray(requests)) {
+      throw new ValidationError('requests must be an array');
+    }
+    if (requests.length === 0) return [];
+
+    const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
+    if (!Number.isInteger(batchSize) || batchSize < 1) {
+      throw new ValidationError('batchSize must be a positive integer');
+    }
+
+    const criteria = this.prepareCriteria(requests);
+    const results: QueryResult[] = [];
+
+    for (let i = 0; i < criteria.length; i += batchSize) {
+      results.push(...(await this.query(criteria.slice(i, i + batchSize))));
+    }
+
+    return results;
+  }
+
+  /**
+   * Discard the cached STS token; the next query requests a new one
+   */
+  clearTokenCache(): void {
+    this.tokenProvider.invalidate();
   }
 
   private validateConfig(config: KPSClientConfig): void {
-    if (!config.username || !config.password) {
+    if (!config || !config.username || !config.password) {
       throw new ValidationError('KPS username and password are required');
     }
   }
 
-  private validateRequest(request: QueryRequest): void {
-    const errors: string[] = [];
+  private prepareCriteria(requests: QueryRequest[]): NormalizedQuery[] {
+    const failures: Array<{ index: number; errors: string[] }> = [];
 
-    if (!request.tcno || !/^\d{11}$/.test(request.tcno)) {
-      errors.push('tcno must be 11 digits');
+    requests.forEach((request, index) => {
+      const errors = collectValidationErrors(request, { validateChecksum: this.validateChecksum });
+      if (errors.length > 0) failures.push({ index, errors });
+    });
+
+    if (failures.length > 0) {
+      throw new ValidationError(
+        'Invalid request parameters',
+        requests.length === 1 ? { errors: failures[0].errors } : { errors: failures }
+      );
     }
 
-    if (!request.firstname || request.firstname.trim().length === 0) {
-      errors.push('firstname is required');
-    }
-
-    if (!request.lastname || request.lastname.trim().length === 0) {
-      errors.push('lastname is required');
-    }
-
-    if (!request.birthyear || !/^\d{4}$/.test(request.birthyear)) {
-      errors.push('birthyear must be 4 digits');
-    }
-
-    if (request.birthmonth && !/^(0?[1-9]|1[0-2])$/.test(request.birthmonth)) {
-      errors.push('birthmonth must be 1-12');
-    }
-
-    if (request.birthday && !/^(0?[1-9]|[12]\d|3[01])$/.test(request.birthday)) {
-      errors.push('birthday must be 1-31');
-    }
-
-    if (errors.length > 0) {
-      throw new ValidationError('Invalid request parameters', { errors });
-    }
+    return requests.map(normalizeRequest);
   }
 
-  private async getSecurityToken(): Promise<STSArtifacts> {
-    const soapRequest = buildSTSRequest(this.username, this.password);
+  private async query(criteria: NormalizedQuery[]): Promise<QueryResult[]> {
+    const bodyXML = buildQueryBody(criteria);
+    const responseXML = await this.sendWithToken(bodyXML);
+    const records = await this.responseParser.parseRecords(responseXML, {
+      includeRaw: this.includeRaw,
+    });
+    return this.matchRecords(criteria, records, responseXML);
+  }
 
-    if (this.debug) {
-      console.log('[KPS Debug] STS Request:', soapRequest);
-    }
+  /**
+   * Send the body signed with the current token. A cached token rejected by KPS
+   * (e.g. expired early) is replaced once; KPS rejects these before running the query.
+   */
+  private async sendWithToken(bodyXML: string): Promise<string> {
+    const { artifacts, fromCache } = await this.tokenProvider.get();
 
     try {
-      const response = await this.httpClient.post(KPS_URLS.STS, soapRequest);
+      return await this.callService(buildSignedEnvelope(artifacts, bodyXML));
+    } catch (error) {
+      if (!fromCache || !this.isSecurityFault(error)) throw error;
 
-      if (this.debug) {
-        console.log('[KPS Debug] STS Response Status:', response.status);
-        console.log('[KPS Debug] STS Response:', response.data);
-      }
+      this.log('Cached token rejected, requesting a new one');
+      this.tokenProvider.invalidate(artifacts);
+      const fresh = await this.tokenProvider.get();
+      return await this.callService(buildSignedEnvelope(fresh.artifacts, bodyXML));
+    }
+  }
 
-      if (response.status !== 200) {
-        throw new STSError(`STS returned HTTP ${response.status}`);
-      }
+  /**
+   * KPS answers a criteria list with a result list in the same order; when the counts
+   * differ, results are matched by the KimlikNo KPS echoes back
+   */
+  private matchRecords(
+    criteria: NormalizedQuery[],
+    records: ParsedRecord[],
+    responseXML: string
+  ): QueryResult[] {
+    if (records.length === criteria.length) {
+      return records.map((r) => r.result);
+    }
 
-      return this.parseSTSResponse(response.data);
+    const remaining = [...records];
+    return criteria.map((c) => {
+      const position = remaining.findIndex((r) => r.kimlikNo === c.tcno);
+      return position !== -1
+        ? remaining.splice(position, 1)[0].result
+        : this.responseParser.notFound(responseXML, { includeRaw: this.includeRaw });
+    });
+  }
+
+  private async requestSecurityToken(): Promise<STSArtifacts> {
+    const soapRequest = buildSTSRequest(this.username, this.password);
+    this.log('STS Request:', redactSecrets(soapRequest));
+
+    let responseData: string;
+    try {
+      const response = await this.httpClient.post(this.endpoints.sts, soapRequest);
+      this.log('STS Response Status:', response.status);
+      this.log('STS Response:', redactSecrets(response.data));
+      responseData = response.data;
     } catch (error: any) {
-      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-        throw new TimeoutError('STS request timed out');
-      }
+      throw this.toTransportError(error, 'STS');
+    }
 
-      if (error.response) {
-        const responseData = typeof error.response.data === 'string' 
-          ? error.response.data 
+    return parseSTSResponse(responseData);
+  }
+
+  private async callService(envelope: string): Promise<string> {
+    this.log('Service Request:', envelope);
+
+    try {
+      const response = await this.httpClient.post(this.endpoints.query, envelope);
+      this.log('Service Response Status:', response.status);
+      this.log('Service Response:', response.data);
+      return response.data;
+    } catch (error: any) {
+      throw this.toTransportError(error, 'Service');
+    }
+  }
+
+  private toTransportError(error: any, kind: 'STS' | 'Service'): Error {
+    if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      return new TimeoutError(`${kind} request timed out`, { code: error.code });
+    }
+
+    if (error.response) {
+      const responseData =
+        typeof error.response.data === 'string'
+          ? error.response.data
           : JSON.stringify(error.response.data);
-        
-        const authError = this.checkAuthenticationError(responseData);
-        if (authError) throw authError;
+      const fault = parseSoapFault(responseData);
+      this.log(`${kind} Error Response:`, redactSecrets(responseData));
 
-        throw new STSError(`STS request failed: ${error.message}`, { response: error.response.data });
+      if (kind === 'STS') {
+        const authError = this.checkAuthenticationError(responseData, fault);
+        if (authError) return authError;
       }
 
-      if (error.request) {
-        throw new NetworkError('Failed to connect to STS service');
-      }
-
-      throw error;
+      const ErrorClass = kind === 'STS' ? STSError : ServiceError;
+      const reason = fault?.reason || fault?.subcode || error.message;
+      return new ErrorClass(`${kind} request failed: ${reason}`, {
+        response: error.response.data,
+        statusCode: error.response.status,
+        ...(fault ? { fault } : {}),
+      });
     }
+
+    if (error.request) {
+      return new NetworkError(
+        `Failed to connect to ${kind === 'STS' ? 'STS' : 'KPS'} service${error.code ? ` (${error.code})` : ''}`,
+        { code: error.code, message: error.message }
+      );
+    }
+
+    return error;
   }
 
-  private parseSTSResponse(responseXML: string): STSArtifacts {
-    const binarySecret = this.extractElementValue(responseXML, 'BinarySecret');
-    if (!binarySecret) {
-      throw new STSError('BinarySecret not found in STS response');
-    }
-
-    const keyIdentifier = this.extractElementValue(responseXML, 'KeyIdentifier');
-    if (!keyIdentifier) {
-      throw new STSError('KeyIdentifier not found in STS response');
-    }
-
-    const tokenXML = extractInnerXML(responseXML, 'RequestedSecurityToken');
-    if (!tokenXML) {
-      throw new STSError('RequestedSecurityToken not found in STS response');
-    }
-
-    return {
-      binarySecretB64: binarySecret.trim(),
-      tokenXML: tokenXML.trim(),
-      assertionID: keyIdentifier.trim(),
-    };
-  }
-
-  private extractElementValue(xml: string, tagName: string): string {
-    const regex = new RegExp(`<[^:]*:?${tagName}[^>]*>([^<]*)<`, 'i');
-    const match = xml.match(regex);
-    return match ? match[1].trim() : '';
-  }
-
-  private checkAuthenticationError(responseXml: string): AuthenticationError | null {
-    if (!responseXml.includes('s:Fault') && !responseXml.includes('soap:Fault')) {
-      return null;
-    }
+  private checkAuthenticationError(
+    responseXml: string,
+    fault: SoapFault | null
+  ): AuthenticationError | null {
+    if (!fault) return null;
 
     const authPatterns = [
       /Invalid username\/password/i,
@@ -236,125 +337,33 @@ export class KPSClient {
       /Kullanıcı adı veya parola hatalı/i,
       /Yetkilendirme hatası/i,
       /SecurityFaultContract/i,
+      /FailedAuthentication/i,
+      /security token .*could not be (?:validated|authenticated)/i,
     ];
 
-    const isAuthError = authPatterns.some(pattern => pattern.test(responseXml));
-    
-    if (isAuthError) {
-      const reasonMatch = responseXml.match(/<s:Text[^>]*>([^<]+)<\/s:Text>/i);
-      const reason = reasonMatch ? reasonMatch[1].trim() : 'Invalid username/password';
-      
-      return new AuthenticationError(
-        `KPS authentication failed: ${reason}. Please check your credentials.`,
-        { hint: 'Verify that your KPS credentials are correct and active' }
-      );
-    }
-
-    return null;
-  }
-
-  private buildSignedEnvelope(artifacts: STSArtifacts, bodyXML: string): string {
-    const { xml: timestampXML, xmlForEnvelope: timestampXMLForEnvelope } = buildTimestamp();
-    const canonicalTimestamp = canonicalizeXML(timestampXML);
-    const timestampDigest = sha1Digest(canonicalTimestamp);
-    const digestValue = base64Encode(timestampDigest);
-
-    const { xml: signedInfoXML, xmlForSignature: signedInfoForSignature } = buildSignedInfo(digestValue);
-    const canonicalSignedInfo = canonicalizeXML(signedInfoXML);
-    const secretKey = base64Decode(artifacts.binarySecretB64);
-    const signatureBytes = hmacSha1(secretKey, canonicalSignedInfo);
-    const signatureValue = base64Encode(signatureBytes);
-
-    const signature = buildSignature(signedInfoForSignature, signatureValue, artifacts.assertionID);
-
-    return buildServiceEnvelope(timestampXMLForEnvelope, artifacts.tokenXML, signature, bodyXML);
-  }
-
-  private async callService(envelope: string): Promise<string> {
-    if (this.debug) {
-      console.log('[KPS Debug] Service Request:', envelope);
-    }
-
-    try {
-      const response = await this.httpClient.post(KPS_URLS.QUERY, envelope);
-
-      if (this.debug) {
-        console.log('[KPS Debug] Service Response Status:', response.status);
-        console.log('[KPS Debug] Service Response:', response.data);
-      }
-
-      if (response.status !== 200) {
-        const faultMessage = this.extractFaultMessage(response.data);
-        throw new ServiceError(
-          `Service returned HTTP ${response.status}${faultMessage ? `: ${faultMessage}` : ''}`,
-          { response: response.data }
-        );
-      }
-
-      return response.data;
-    } catch (error: any) {
-      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-        throw new TimeoutError('Service request timed out');
-      }
-
-      if (error.response) {
-        const responseData = typeof error.response.data === 'string' 
-          ? error.response.data 
-          : JSON.stringify(error.response.data);
-        
-        const faultMessage = this.extractFaultMessage(responseData);
-        const errorMessage = faultMessage 
-          ? `Service request failed: ${faultMessage}`
-          : `Service request failed: ${error.message}`;
-        
-        throw new ServiceError(errorMessage, { 
-          response: error.response.data,
-          statusCode: error.response.status,
-        });
-      }
-
-      if (error.request) {
-        throw new NetworkError('Failed to connect to KPS service');
-      }
-
-      throw error;
-    }
-  }
-
-  private extractFaultMessage(responseXml: string): string | null {
-    if (!responseXml || typeof responseXml !== 'string') {
+    if (!authPatterns.some((pattern) => pattern.test(responseXml))) {
       return null;
     }
 
-    // Try to extract fault reason/text from SOAP fault
-    const faultPatterns = [
-      /<s:Text[^>]*>([^<]+)<\/s:Text>/i,
-      /<soap:Text[^>]*>([^<]+)<\/soap:Text>/i,
-      /<faultstring[^>]*>([^<]+)<\/faultstring>/i,
-      /<Reason[^>]*>.*?<Text[^>]*>([^<]+)<\/Text>.*?<\/Reason>/is,
-    ];
+    const reason = fault.reason || 'Invalid username/password';
+    return new AuthenticationError(
+      `KPS authentication failed: ${reason}. Please check your credentials.`,
+      { hint: 'Verify that your KPS credentials are correct and active', fault }
+    );
+  }
 
-    for (const pattern of faultPatterns) {
-      const match = responseXml.match(pattern);
-      if (match && match[1]) {
-        return match[1].trim();
-      }
+  private isSecurityFault(error: unknown): boolean {
+    if (!(error instanceof ServiceError)) return false;
+    const fault: SoapFault | undefined = error.details?.fault;
+    const text = `${fault?.subcode || ''} ${fault?.reason || ''}`;
+    return /InvalidSecurity|FailedAuthentication|MessageExpired|verifying security|security token/i.test(
+      text
+    );
+  }
+
+  private log(message: string, ...args: unknown[]): void {
+    if (this.debug) {
+      this.logger.debug(`[KPS Debug] ${message}`, ...args);
     }
-
-    // Try to extract fault code
-    const faultCodePatterns = [
-      /<s:Value[^>]*>([^<]+)<\/s:Value>/i,
-      /<soap:Value[^>]*>([^<]+)<\/soap:Value>/i,
-      /<faultcode[^>]*>([^<]+)<\/faultcode>/i,
-    ];
-
-    for (const pattern of faultCodePatterns) {
-      const match = responseXml.match(pattern);
-      if (match && match[1]) {
-        return match[1].trim();
-      }
-    }
-
-    return null;
   }
 }

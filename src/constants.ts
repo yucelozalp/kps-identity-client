@@ -19,6 +19,7 @@ export const NAMESPACES = {
   DSIG_NS: 'http://www.w3.org/2000/09/xmldsig#',
   TRUST_NS: 'http://docs.oasis-open.org/ws-sx/ws-trust/200512',
   WSP_NS: 'http://schemas.xmlsoap.org/ws/2004/09/policy',
+  XSI_NS: 'http://www.w3.org/2001/XMLSchema-instance',
   BODY_NS: 'http://kps.nvi.gov.tr/2025/08/01',
 } as const;
 
@@ -32,7 +33,8 @@ export const SERVICE_URIS = {
   TOKEN_TYPE: 'http://docs.oasis-open.org/wss/oasis-wss-saml-token-profile-1.1#SAMLV1.1',
   REQUEST_TYPE: 'http://docs.oasis-open.org/ws-sx/ws-trust/200512/Issue',
   KEY_TYPE: 'http://docs.oasis-open.org/ws-sx/ws-trust/200512/SymmetricKey',
-  PASSWORD_TYPE: 'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText',
+  PASSWORD_TYPE:
+    'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText',
 } as const;
 
 /**
@@ -43,7 +45,8 @@ export const ALGORITHMS = {
   C14N: 'http://www.w3.org/2001/10/xml-exc-c14n#',
   HMAC_SHA1: 'http://www.w3.org/2000/09/xmldsig#hmac-sha1',
   SHA1: 'http://www.w3.org/2000/09/xmldsig#sha1',
-  SAML_ASSERTION_ID: 'http://docs.oasis-open.org/wss/oasis-wss-saml-token-profile-1.0#SAMLAssertionID',
+  SAML_ASSERTION_ID:
+    'http://docs.oasis-open.org/wss/oasis-wss-saml-token-profile-1.0#SAMLAssertionID',
 } as const;
 
 /**
@@ -51,3 +54,27 @@ export const ALGORITHMS = {
  * @internal
  */
 export const DEFAULT_TIMEOUT = 30000;
+
+/**
+ * Lifetime of the WS-Security timestamp sent with each request
+ * @internal
+ */
+export const TIMESTAMP_TTL = 5 * 60 * 1000;
+
+/**
+ * Token lifetime assumed when the STS response carries no Lifetime element
+ * @internal
+ */
+export const DEFAULT_TOKEN_TTL = 5 * 60 * 1000;
+
+/**
+ * A cached token is renewed this long before it expires
+ * @internal
+ */
+export const TOKEN_REFRESH_MARGIN = 60 * 1000;
+
+/**
+ * Default number of criteria sent in a single KPS request by verifyMany()
+ * @internal
+ */
+export const DEFAULT_BATCH_SIZE = 50;

@@ -13,7 +13,7 @@ async function main() {
   try {
     // Verify identity
     const result = await client.verify({
-      tcno: '12345678901',
+      tcno: '10000000146',
       firstname: 'AHMET',
       lastname: 'YILMAZ',
       birthyear: '1990',
@@ -27,7 +27,6 @@ async function main() {
     console.log('- Message:', result.aciklama);
     console.log('- Person Type:', result.person);
     console.log('- Details:', result.extra);
-
   } catch (error: any) {
     console.error('Error:', error.message);
     if (error.code) {

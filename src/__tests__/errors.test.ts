@@ -13,7 +13,7 @@ describe('Errors', () => {
   describe('KPSError', () => {
     it('should create error with properties', () => {
       const error = new KPSError(ErrorCode.INTERNAL_ERROR, 'Test error', { detail: 'test' });
-      
+
       expect(error.code).toBe(ErrorCode.INTERNAL_ERROR);
       expect(error.message).toBe('Test error');
       expect(error.details).toEqual({ detail: 'test' });
